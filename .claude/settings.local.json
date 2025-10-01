@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(echo $OPENAI_API_KEY)",
+      "Bash(pip3 install:*)",
+      "Bash(python3:*)",
+      "Bash(./venv/bin/pip install openai --quiet)",
+      "Bash(node:*)",
+      "Bash(npm init:*)",
+      "Bash(npm install:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

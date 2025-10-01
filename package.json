@@ -4,7 +4,11 @@
   "main": "index.js",
   "type": "module",
   "scripts": {
+    "start": "node ai-video-dub.js",
     "dub": "node dub-video.js",
+    "download": "node yt-downloader-nodejs.js",
+    "download-ytdlp": "node youtube-downloader.js",
+    "download-old": "node download-youtube.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
@@ -12,6 +16,7 @@
   "license": "ISC",
   "description": "",
   "dependencies": {
+    "@distube/ytdl-core": "^4.16.12",
     "dotenv": "^17.2.3",
     "openai": "^5.23.2"
   }
