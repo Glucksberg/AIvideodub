@@ -466,4 +466,4 @@ Projeto criado para dublagem automatizada de vídeos.
 
 ---
 
-**Nota:** Este projeto usa serviços pagos da OpenAI. Monitore seus custos em https://platform.openai.com/usage
+**Nota:** Este projeto usa serviços pagos da OpenAI. Monitore seus custos em https://platform.openai.com/usage# Test commit from WSL
