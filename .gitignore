@@ -23,6 +23,7 @@ __pycache__/
 *.mkv
 *.flv
 *.wmv
+*.part
 
 # Audio files
 *.mp3
