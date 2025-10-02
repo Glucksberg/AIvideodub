@@ -147,6 +147,56 @@ function compareStructures(original, dubbed) {
   }
 }
 
+async function analyzeWithTimestamps(segmentsFile) {
+  console.log(`\n📊 ANÁLISE COM TIMESTAMPS DO WHISPER:\n`);
+  
+  try {
+    const segmentsData = JSON.parse(fs.readFileSync(segmentsFile, 'utf8'));
+    
+    console.log(`   Duração total: ${segmentsData.duration.toFixed(2)}s`);
+    console.log(`   Total de segmentos: ${segmentsData.segmentCount}`);
+    console.log(`   Pausas detectadas: ${segmentsData.silenceGaps.length}\n`);
+    
+    if (segmentsData.silenceGaps.length > 0) {
+      console.log(`   🔇 PAUSAS/SILÊNCIOS:`);
+      segmentsData.silenceGaps.forEach((gap, i) => {
+        const mins = Math.floor(gap.start / 60);
+        const secs = (gap.start % 60).toFixed(1);
+        console.log(`      ${i + 1}. ${mins}:${secs.padStart(4, '0')} → ${gap.duration.toFixed(2)}s`);
+      });
+      console.log('');
+    }
+    
+    // Show first and last 5 segments
+    console.log(`   📝 PRIMEIROS 5 SEGMENTOS:`);
+    segmentsData.segments.slice(0, 5).forEach((seg, i) => {
+      const mins = Math.floor(seg.start / 60);
+      const secs = (seg.start % 60).toFixed(1);
+      const preview = seg.text ? seg.text.substring(0, 50) + '...' : '(sem texto)';
+      console.log(`      ${i + 1}. ${mins}:${secs.padStart(4, '0')} (${seg.duration.toFixed(1)}s) - ${preview}`);
+    });
+    
+    if (segmentsData.segments.length > 10) {
+      console.log(`      ... (${segmentsData.segments.length - 10} segmentos no meio) ...`);
+      
+      console.log(`\n   📝 ÚLTIMOS 5 SEGMENTOS:`);
+      segmentsData.segments.slice(-5).forEach((seg, i) => {
+        const idx = segmentsData.segments.length - 5 + i;
+        const mins = Math.floor(seg.start / 60);
+        const secs = (seg.start % 60).toFixed(1);
+        const preview = seg.text ? seg.text.substring(0, 50) + '...' : '(sem texto)';
+        console.log(`      ${idx + 1}. ${mins}:${secs.padStart(4, '0')} (${seg.duration.toFixed(1)}s) - ${preview}`);
+      });
+    }
+    
+    return segmentsData;
+    
+  } catch (error) {
+    console.log(`   ⚠️  Arquivo de timestamps não encontrado: ${segmentsFile}`);
+    return null;
+  }
+}
+
 async function main() {
   console.log('\n╔════════════════════════════════════════════════╗');
   console.log('║   🎬 ANALISADOR DE SINCRONIZAÇÃO DE VÍDEO     ║');
@@ -155,14 +205,16 @@ async function main() {
   const args = process.argv.slice(2);
   
   if (args.length < 2) {
-    console.log('Uso: node analyze-sync.js <video_original.mp4> <video_dublado.mp4>');
+    console.log('Uso: node analyze-sync.js <video_original.mp4> <video_dublado.mp4> [segments.json]');
     console.log('\nExemplo:');
     console.log('  node analyze-sync.js "video.mp4" "video_en.mp4"');
+    console.log('  node analyze-sync.js "video.mp4" "video_en.mp4" "debug_logs/segments_123.json"');
     process.exit(1);
   }
   
   const originalVideo = args[0];
   const dubbedVideo = args[1];
+  const segmentsFile = args[2]; // Optional
   
   if (!fs.existsSync(originalVideo)) {
     console.error(`❌ Arquivo não encontrado: ${originalVideo}`);
@@ -172,6 +224,12 @@ async function main() {
   if (!fs.existsSync(dubbedVideo)) {
     console.error(`❌ Arquivo não encontrado: ${dubbedVideo}`);
     process.exit(1);
+  }
+  
+  // Analyze with timestamps if provided
+  let segmentsData = null;
+  if (segmentsFile && fs.existsSync(segmentsFile)) {
+    segmentsData = await analyzeWithTimestamps(segmentsFile);
   }
   
   // Extract audio from both videos

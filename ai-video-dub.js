@@ -211,6 +211,260 @@ async function generateTTSForChunks(text, voiceId, timestamp, targetDuration = n
   return finalAudioFile;
 }
 
+// Generate TTS with preserved silence gaps
+async function generateTTSWithGaps(translatedText, voiceId, timestamp, segments, silenceGaps, totalDuration, silenceAtStart, silenceAtEnd, inputVideo, audioFile, targetLang) {
+  console.log('🎯 Dividindo texto em blocos correspondentes às pausas...\n');
+  
+  // Create speech blocks based on silence gaps
+  const speechBlocks = [];
+  
+  if (segments.length === 0) {
+    // No segments - shouldn't happen but handle it
+    speechBlocks.push({
+      start: silenceAtStart,
+      end: totalDuration - silenceAtEnd,
+      duration: totalDuration - silenceAtStart - silenceAtEnd,
+      text: translatedText
+    });
+  } else {
+    // Create blocks from segments, grouping segments between gaps
+    let currentBlockSegments = [];
+    let blockStart = segments[0].start;
+    
+    segments.forEach((seg, i) => {
+      currentBlockSegments.push(seg);
+      
+      // Check if there's a gap after this segment
+      const gapAfter = silenceGaps.find(g => g.afterSegment === i);
+      
+      if (gapAfter || i === segments.length - 1) {
+        // End of block
+        const blockEnd = seg.end;
+        const blockDuration = blockEnd - blockStart;
+        
+        speechBlocks.push({
+          start: blockStart,
+          end: blockEnd,
+          duration: blockDuration,
+          text: '', // Will be filled with TRANSLATED text below
+          segmentCount: currentBlockSegments.length
+        });
+        
+        // Start new block after gap
+        if (i < segments.length - 1) {
+          blockStart = segments[i + 1].start;
+          currentBlockSegments = [];
+        }
+      }
+    });
+    
+    // ALWAYS distribute TRANSLATED text proportionally to blocks
+    // NOTE: Segments contain ORIGINAL language text, but we need TRANSLATED text for TTS
+    const totalSpeechDuration = speechBlocks.reduce((sum, b) => sum + b.duration, 0);
+    
+    console.log('📝 Distribuindo texto traduzido proporcionalmente aos blocos...\n');
+    
+    const words = translatedText.split(/\s+/);
+    let wordIndex = 0;
+    
+    speechBlocks.forEach((block, i) => {
+      const proportion = block.duration / totalSpeechDuration;
+      const wordsForBlock = Math.round(words.length * proportion);
+      const blockWords = words.slice(wordIndex, wordIndex + wordsForBlock);
+      block.text = blockWords.join(' ');
+      wordIndex += wordsForBlock;
+      
+      console.log(`   Bloco ${i + 1}: ${block.duration.toFixed(1)}s (${(proportion * 100).toFixed(1)}%) → ${blockWords.length} palavras`);
+    });
+    
+    // Add any remaining words to last block
+    if (wordIndex < words.length) {
+      const remaining = words.slice(wordIndex).join(' ');
+      speechBlocks[speechBlocks.length - 1].text += ' ' + remaining;
+      console.log(`   ⚠️  ${words.length - wordIndex} palavras restantes adicionadas ao último bloco`);
+    }
+    console.log('');
+  }
+  
+  console.log(`📊 Total de ${speechBlocks.length} blocos de fala:\n`);
+  speechBlocks.forEach((block, i) => {
+    const mins = Math.floor(block.start / 60);
+    const secs = (block.start % 60).toFixed(1);
+    console.log(`   ${i + 1}. ${mins}:${secs.padStart(4, '0')} → ${block.duration.toFixed(2)}s (${block.text.length} chars)`);
+  });
+  console.log('');
+  
+  // Generate TTS for each block
+  const audioFiles = [];
+  
+  for (let i = 0; i < speechBlocks.length; i++) {
+    const block = speechBlocks[i];
+    console.log(`🔊 Gerando áudio para bloco ${i + 1}/${speechBlocks.length}...`);
+    console.log(`   Duração alvo: ${block.duration.toFixed(2)}s`);
+    console.log(`   Texto: ${block.text.substring(0, 100)}...`);
+    
+    const blockAudioFile = `speech_block_${timestamp}_${i}.mp3`;
+    
+    // Generate TTS for this block
+    const speechResponse = await openai.audio.speech.create({
+      model: 'gpt-4o-mini-tts',
+      voice: voiceId,
+      input: block.text
+    });
+    
+    const buffer = Buffer.from(await speechResponse.arrayBuffer());
+    fs.writeFileSync(blockAudioFile, buffer);
+    
+    // Check duration and adjust if needed
+    const { stdout: blockDurInfo } = await execAsync(`ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${blockAudioFile}"`);
+    const blockAudioDuration = parseFloat(blockDurInfo.trim());
+    
+    console.log(`   Gerado: ${blockAudioDuration.toFixed(2)}s`);
+    
+    // Adjust speed if needed
+    if (Math.abs(blockAudioDuration - block.duration) > 1.0) {
+      const ratio = block.duration / blockAudioDuration;
+      console.log(`   Ajustando velocidade (ratio: ${(ratio * 100).toFixed(1)}%)...`);
+      
+      const slowdownFactor = 1 / ratio;
+      const adjustedFile = `speech_block_${timestamp}_${i}_adjusted.mp3`;
+      
+      if (slowdownFactor >= 0.5 && slowdownFactor <= 2.0) {
+        await execAsync(`ffmpeg -i "${blockAudioFile}" -filter:a "atempo=${slowdownFactor.toFixed(6)}" "${adjustedFile}" -y`);
+        fs.unlinkSync(blockAudioFile);
+        audioFiles.push(adjustedFile);
+        console.log(`   ✅ Ajustado para ${block.duration.toFixed(2)}s`);
+      } else {
+        console.log(`   ⚠️  Ratio fora do limite, usando sem ajuste`);
+        audioFiles.push(blockAudioFile);
+      }
+    } else {
+      audioFiles.push(blockAudioFile);
+      console.log(`   ✅ Duração OK`);
+    }
+    console.log('');
+  }
+  
+  // Now concatenate with silences
+  console.log('🔗 Concatenando blocos com pausas...\n');
+  
+  const concatParts = [];
+  
+  // Add initial silence
+  if (silenceAtStart > 0.1) {
+    const startSilenceFile = `silence_start_${timestamp}.mp3`;
+    await execAsync(`ffmpeg -f lavfi -t ${silenceAtStart} -i anullsrc=r=44100:cl=stereo "${startSilenceFile}" -y`);
+    concatParts.push(`file '${startSilenceFile}'`);
+    console.log(`   🔇 Silêncio inicial: ${silenceAtStart.toFixed(2)}s`);
+  }
+  
+  // Add speech blocks with gaps between them
+  for (let i = 0; i < audioFiles.length; i++) {
+    concatParts.push(`file '${audioFiles[i]}'`);
+    console.log(`   🗣️  Bloco ${i + 1}: ${speechBlocks[i].duration.toFixed(2)}s`);
+    
+    // Add gap if not last block
+    if (i < audioFiles.length - 1) {
+      const gap = silenceGaps[i];
+      if (gap) {
+        const gapFile = `silence_gap_${timestamp}_${i}.mp3`;
+        await execAsync(`ffmpeg -f lavfi -t ${gap.duration} -i anullsrc=r=44100:cl=stereo "${gapFile}" -y`);
+        concatParts.push(`file '${gapFile}'`);
+        console.log(`   🔇 Pausa: ${gap.duration.toFixed(2)}s`);
+      }
+    }
+  }
+  
+  // Add final silence
+  if (silenceAtEnd > 0.1) {
+    const endSilenceFile = `silence_end_${timestamp}.mp3`;
+    await execAsync(`ffmpeg -f lavfi -t ${silenceAtEnd} -i anullsrc=r=44100:cl=stereo "${endSilenceFile}" -y`);
+    concatParts.push(`file '${endSilenceFile}'`);
+    console.log(`   🔇 Silêncio final: ${silenceAtEnd.toFixed(2)}s`);
+  }
+  
+  // Concatenate all parts
+  const concatListFile = `concat_with_gaps_${timestamp}.txt`;
+  fs.writeFileSync(concatListFile, concatParts.join('\n'));
+  
+  const finalAudioFile = `dubbed_audio_with_gaps_${timestamp}.mp3`;
+  await execAsync(`ffmpeg -f concat -safe 0 -i "${concatListFile}" -c copy "${finalAudioFile}" -y`);
+  
+  console.log(`\n✅ Áudio final gerado com pausas preservadas!`);
+  
+  // Verify duration
+  const { stdout: finalDurInfo } = await execAsync(`ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${finalAudioFile}"`);
+  const finalDuration = parseFloat(finalDurInfo.trim());
+  
+  console.log(`   Duração final: ${finalDuration.toFixed(2)}s`);
+  console.log(`   Duração esperada: ${totalDuration.toFixed(2)}s`);
+  console.log(`   Diferença: ${Math.abs(finalDuration - totalDuration).toFixed(2)}s\n`);
+  
+  // Cleanup temp files
+  audioFiles.forEach(f => { if (fs.existsSync(f)) fs.unlinkSync(f); });
+  if (fs.existsSync(concatListFile)) fs.unlinkSync(concatListFile);
+  
+  // Continue with video merging (copied from original flow)
+  console.log('✅ Áudio dublado gerado\n');
+  
+  console.log('⏱️  Verificando duração do vídeo/áudio...');
+  const { stdout: videoInfo } = await execAsync(`ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${inputVideo}"`);
+  const videoDuration = parseFloat(videoInfo.trim());
+  
+  console.log(`📹 Vídeo: ${videoDuration.toFixed(2)}s`);
+  console.log(`🎵 Áudio: ${finalDuration.toFixed(2)}s\n`);
+  
+  const dubbedAudioFile = `dubbed_audio_${timestamp}.mp3`;
+  const outputVideo = inputVideo.replace('.mp4', `_${targetLang.code}.mp4`);
+  
+  console.log('🎥 Substituindo áudio no vídeo...');
+  await execAsync(`ffmpeg -i "${inputVideo}" -i "${finalAudioFile}" -c:v copy -c:a aac -b:a 192k -map 0:v:0 -map 1:a:0 -shortest "${outputVideo}" -y`);
+  console.log('✅ Vídeo dublado criado!\n');
+  
+  console.log('🧹 Limpando arquivos temporários...');
+  if (fs.existsSync(audioFile)) fs.unlinkSync(audioFile);
+  if (fs.existsSync(finalAudioFile)) fs.unlinkSync(finalAudioFile);
+  if (fs.existsSync(dubbedAudioFile)) fs.unlinkSync(dubbedAudioFile);
+  
+  // Clean up any remaining temp files
+  const tempFiles = fs.readdirSync('.').filter(f => 
+    f.includes(`_${timestamp}`) && 
+    (f.endsWith('.mp3') || f.endsWith('.txt'))
+  );
+  tempFiles.forEach(f => {
+    if (fs.existsSync(f)) fs.unlinkSync(f);
+  });
+  
+  console.log('✅ Limpeza concluída\n');
+  
+  console.log(`🎉 PRONTO! Seu vídeo dublado está aqui: ${outputVideo}\n`);
+  
+  return outputVideo;
+}
+
+// Helper function to detect silence gaps between speech segments
+function detectSilenceGaps(segments, minGapDuration = 2.0) {
+  const gaps = [];
+  
+  for (let i = 0; i < segments.length - 1; i++) {
+    const currentEnd = segments[i].end;
+    const nextStart = segments[i + 1].start;
+    const gapDuration = nextStart - currentEnd;
+    
+    if (gapDuration >= minGapDuration) {
+      gaps.push({
+        start: currentEnd,
+        end: nextStart,
+        duration: gapDuration,
+        afterSegment: i,
+        beforeSegment: i + 1
+      });
+    }
+  }
+  
+  return gaps;
+}
+
 // Hybrid method: Whisper-1 for timestamps + GPT for refinement
 async function transcribeWithHybridMethod(audioFile, language, duration, timestamp) {
   console.log('🔬 Método híbrido: Whisper-1 (timestamps precisos)\n');
@@ -265,10 +519,24 @@ async function transcribeWithHybridMethod(audioFile, language, duration, timesta
   console.log('✅ Transcrição híbrida completa\n');
   console.log(`📊 Total de segmentos: ${allSegments.length}\n`);
   
+  // Detect silence gaps between segments
+  const silenceGaps = detectSilenceGaps(allSegments, 2.0);
+  
+  if (silenceGaps.length > 0) {
+    console.log(`🔇 Pausas/silêncios detectados no meio: ${silenceGaps.length}`);
+    silenceGaps.forEach((gap, i) => {
+      const mins = Math.floor(gap.start / 60);
+      const secs = (gap.start % 60).toFixed(1);
+      console.log(`   ${i + 1}. ${mins}:${secs.padStart(4, '0')} → ${gap.duration.toFixed(2)}s`);
+    });
+    console.log('');
+  }
+  
   return {
     text: allTranscriptions.join(' '),
     duration: duration,
-    segments: allSegments
+    segments: allSegments,
+    silenceGaps: silenceGaps
   };
 }
 
@@ -294,36 +562,94 @@ async function transcribeAudioFile(audioFile, language, timestamp, useHybridMeth
     
     const fullText = transcription.text;
     
-    // Detect silence at the end using ffmpeg
+    // Detect ALL silences using ffmpeg
     console.log('🔍 Detectando silêncios no áudio...');
-    const { stdout: silenceOutput } = await execAsync(`ffmpeg -i "${audioFile}" -af silencedetect=noise=-30dB:d=0.5 -f null - 2>&1 | grep silence_end`);
+    const { stdout: silenceOutput } = await execAsync(`ffmpeg -i "${audioFile}" -af silencedetect=noise=-30dB:d=2.0 -f null - 2>&1 | grep "silence_"`);
     
-    let lastSpeechEnd = duration;
-    if (silenceOutput) {
-      const silenceMatches = silenceOutput.match(/silence_end: ([\d.]+)/g);
-      if (silenceMatches && silenceMatches.length > 0) {
-        const lastMatch = silenceMatches[silenceMatches.length - 1];
-        const lastSilenceEnd = parseFloat(lastMatch.match(/([\d.]+)/)[0]);
-        // If last silence ends close to the end, assume speech ends there
-        if (duration - lastSilenceEnd < 2) {
-          lastSpeechEnd = lastSilenceEnd;
-        }
+    // Parse silence detection output
+    const silences = [];
+    const lines = silenceOutput.split('\n');
+    let currentSilence = {};
+    
+    for (const line of lines) {
+      const startMatch = line.match(/silence_start: ([\d.]+)/);
+      const endMatch = line.match(/silence_end: ([\d.]+) \| silence_duration: ([\d.]+)/);
+      
+      if (startMatch) {
+        currentSilence.start = parseFloat(startMatch[1]);
+      }
+      
+      if (endMatch && currentSilence.start !== undefined) {
+        currentSilence.end = parseFloat(endMatch[1]);
+        currentSilence.duration = parseFloat(endMatch[2]);
+        silences.push({ ...currentSilence });
+        currentSilence = {};
       }
     }
     
-    // Create a pseudo-segment for the end
-    const pseudoSegments = [{
-      start: 0,
-      end: lastSpeechEnd,
-      text: fullText
-    }];
+    console.log(`   Silêncios detectados: ${silences.length}`);
+    
+    // Create segments based on silences
+    const pseudoSegments = [];
+    let lastEnd = 0;
+    
+    silences.forEach((silence, i) => {
+      // Speech segment before silence
+      if (silence.start > lastEnd) {
+        pseudoSegments.push({
+          start: lastEnd,
+          end: silence.start,
+          text: '' // Text will be distributed later
+        });
+      }
+      lastEnd = silence.end;
+    });
+    
+    // Final speech segment
+    if (lastEnd < duration) {
+      pseudoSegments.push({
+        start: lastEnd,
+        end: duration,
+        text: ''
+      });
+    }
+    
+    // If no segments created, create one for entire duration
+    if (pseudoSegments.length === 0) {
+      pseudoSegments.push({
+        start: 0,
+        end: duration,
+        text: fullText
+      });
+    } else {
+      // Put all text in first segment for now
+      pseudoSegments[0].text = fullText;
+    }
+    
+    const silenceGaps = silences.map((s, i) => ({
+      start: s.start,
+      end: s.end,
+      duration: s.duration,
+      afterSegment: i,
+      beforeSegment: i + 1
+    }));
+    
+    if (silenceGaps.length > 0) {
+      console.log(`🔇 Pausas/silêncios detectados no meio: ${silenceGaps.length}`);
+      silenceGaps.forEach((gap, i) => {
+        const mins = Math.floor(gap.start / 60);
+        const secs = (gap.start % 60).toFixed(1);
+        console.log(`   ${i + 1}. ${mins}:${secs.padStart(4, '0')} → ${gap.duration.toFixed(2)}s`);
+      });
+    }
     
     console.log(`✅ Transcrição completa\n`);
     
     return { 
       text: fullText, 
       duration: duration,
-      segments: pseudoSegments
+      segments: pseudoSegments,
+      silenceGaps: silenceGaps
     };
   }
   
@@ -591,6 +917,23 @@ Return ONLY the translated text, no explanations or notes.`
     fs.writeFileSync(`${debugFolder}/transcription_${timestamp}.txt`, transcriptionText);
     fs.writeFileSync(`${debugFolder}/translation_${timestamp}.txt`, translatedText);
     
+    // Save segments with timestamps as JSON
+    if (segments && segments.length > 0) {
+      const segmentsData = {
+        duration: originalAudioDuration,
+        segmentCount: segments.length,
+        segments: segments.map(s => ({
+          start: s.start,
+          end: s.end,
+          duration: s.end - s.start,
+          text: s.text || ''
+        })),
+        silenceGaps: transcriptionResult.silenceGaps || []
+      };
+      fs.writeFileSync(`${debugFolder}/segments_${timestamp}.json`, JSON.stringify(segmentsData, null, 2));
+      console.log(`💾 Timestamps salvos em: ${debugFolder}/segments_${timestamp}.json\n`);
+    }
+    
     const transcriptionWords = transcriptionText.split(/\s+/).length;
     const translationWords = translatedText.split(/\s+/).length;
     
@@ -614,6 +957,9 @@ Return ONLY the translated text, no explanations or notes.`
     // Step 4: Generate speech using TTS (with chunking for long texts)
     console.log(`🔊 Gerando áudio dublado com voz ${voiceId}...`);
     
+    // Get silence gaps from transcription result
+    const silenceGaps = transcriptionResult.silenceGaps || [];
+    
     // Calculate speech boundaries (where actual speech starts and ends)
     let speechStart = 0;
     let speechEnd = originalAudioDuration;
@@ -630,9 +976,26 @@ Return ONLY the translated text, no explanations or notes.`
       console.log(`   Silêncio no início: ${silenceAtStart.toFixed(2)}s`);
       console.log(`   Fala: ${speechStart.toFixed(2)}s → ${speechEnd.toFixed(2)}s (duração: ${(speechEnd - speechStart).toFixed(2)}s)`);
       console.log(`   Silêncio no final: ${silenceAtEnd.toFixed(2)}s`);
-      console.log(`   Duração total do vídeo: ${originalAudioDuration.toFixed(2)}s\n`);
+      console.log(`   Duração total do vídeo: ${originalAudioDuration.toFixed(2)}s`);
+      
+      if (silenceGaps.length > 0) {
+        console.log(`   Pausas no meio: ${silenceGaps.length}`);
+        silenceGaps.forEach((gap, i) => {
+          const mins = Math.floor(gap.start / 60);
+          const secs = (gap.start % 60).toFixed(1);
+          console.log(`      ${i + 1}. ${mins}:${secs.padStart(4, '0')} → ${gap.duration.toFixed(2)}s`);
+        });
+      }
+      console.log('');
     }
     
+    // If there are silence gaps in the middle, we need to generate TTS per speech block
+    if (silenceGaps.length > 0) {
+      console.log(`🎯 Modo avançado: Gerando áudio com pausas preservadas\n`);
+      return await generateTTSWithGaps(translatedText, voiceId, timestamp, segments, silenceGaps, originalAudioDuration, silenceAtStart, silenceAtEnd, inputVideo, audioFile, targetLang);
+    }
+    
+    // Original flow: single speech block or no gaps detected
     // Target duration is only for the speech part (excluding leading/trailing silence)
     const targetDuration = speechEnd - speechStart;
     
