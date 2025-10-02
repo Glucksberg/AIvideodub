@@ -161,19 +161,44 @@ async function generateTTSForChunks(text, voiceId, timestamp, targetDuration = n
     console.log(`   Ratio: ${(stretchRatio * 100).toFixed(1)}%\n`);
     
     // Only stretch if we need to slow down (make longer) and difference is significant
-    if (stretchRatio > 1.05 && stretchRatio <= 1.7) {
-      console.log(`🎚️  Ajustando velocidade do áudio dublado...`);
+    if (stretchRatio > 1.05 && stretchRatio <= 2.0) {
+      console.log(`🎚️  Ajustando velocidade do áudio dublado (desacelerando para ${(stretchRatio * 100).toFixed(1)}%)...`);
       const stretchedFile = `dubbed_audio_stretched_${timestamp}.mp3`;
       
-      // Use atempo to slow down the audio (inverse of speedup)
+      // atempo filter: values < 1.0 SLOW DOWN (desacelera), values > 1.0 SPEED UP (acelera)
+      // We need to SLOW DOWN to make audio longer, so use INVERSE of stretchRatio
+      // Example: if audio is 600s and needs to be 1000s, stretchRatio=1.67
+      //          we need atempo=0.6 (1/1.67) to slow it down 40% and make it 67% longer
       const slowdownFactor = 1 / stretchRatio;
-      await execAsync(`ffmpeg -i "${finalAudioFile}" -filter:a "atempo=${slowdownFactor}" "${stretchedFile}" -y`);
+      
+      // atempo only accepts 0.5-2.0, so we might need to chain filters
+      let atempoCommand;
+      if (slowdownFactor >= 0.5) {
+        // Single filter is enough
+        atempoCommand = `atempo=${slowdownFactor.toFixed(6)}`;
+      } else {
+        // Need to chain multiple filters (slowdownFactor < 0.5)
+        // Example: slowdownFactor=0.25 → atempo=0.5,atempo=0.5
+        atempoCommand = `atempo=0.5,atempo=${(slowdownFactor / 0.5).toFixed(6)}`;
+      }
+      
+      console.log(`   Aplicando atempo=${slowdownFactor.toFixed(3)} (${atempoCommand})`);
+      await execAsync(`ffmpeg -i "${finalAudioFile}" -filter:a "${atempoCommand}" "${stretchedFile}" -y`);
       
       // Replace original with stretched
       fs.unlinkSync(finalAudioFile);
       fs.renameSync(stretchedFile, finalAudioFile);
       
       console.log('✅ Duração ajustada\n');
+    } else if (stretchRatio > 2.0) {
+      console.log(`⚠️  AVISO: Ratio muito alto (${(stretchRatio * 100).toFixed(1)}%) - tradução pode estar incompleta!`);
+      console.log(`   Desacelerando no máximo possível (4x via atempo=0.5,atempo=0.5)...\n`);
+      const stretchedFile = `dubbed_audio_stretched_${timestamp}.mp3`;
+      // Chain two atempo=0.5 for 4x slowdown (maximum practical)
+      await execAsync(`ffmpeg -i "${finalAudioFile}" -filter:a "atempo=0.5,atempo=0.5" "${stretchedFile}" -y`);
+      fs.unlinkSync(finalAudioFile);
+      fs.renameSync(stretchedFile, finalAudioFile);
+      console.log('✅ Áudio desacelerado (pode ainda ficar dessincronizado)\n');
     }
   }
   
@@ -215,46 +240,10 @@ async function transcribeWithHybridMethod(audioFile, language, duration, timesta
       timestamp_granularities: ['segment']
     });
     
-    // Step 2: Refine text with GPT - with strict instructions to preserve ALL content
-    console.log(`✨ Refinando texto com gpt-5-nano...`);
-    
-    const charCount = transcription.text.length;
-    console.log(`   Texto original: ${charCount} caracteres`);
-    
-    const refinementResponse = await openai.chat.completions.create({
-      model: 'gpt-5-nano-2025-08-07',
-      messages: [
-        {
-          role: 'system',
-          content: `You are a transcription editor. Your job is ONLY to fix transcription errors (wrong words, typos), correct grammar, and improve readability. 
-
-CRITICAL RULES:
-- You MUST preserve EVERY single piece of information
-- Do NOT summarize, condense, or shorten the text
-- Do NOT skip any sentences or paragraphs
-- The output must be approximately the SAME LENGTH as the input
-- Only fix errors, do not rewrite or paraphrase unnecessarily
-- Return ONLY the corrected text, no explanations
-
-If the input is ${charCount} characters, your output should be around ${charCount} characters (±10%).`
-        },
-        {
-          role: 'user',
-          content: transcription.text
-        }
-      ]
-    });
-    
-    const refinedText = refinementResponse.choices[0].message.content;
-    console.log(`   Texto refinado: ${refinedText.length} caracteres (${((refinedText.length/charCount)*100).toFixed(1)}%)`);
-    
-    // Warn if text was significantly shortened
-    if (refinedText.length < charCount * 0.85) {
-      console.log(`   ⚠️  AVISO: Texto foi reduzido em mais de 15%! Usando original.`);
-      allTranscriptions.push(transcription.text);
-    } else {
-      allTranscriptions.push(refinedText);
-    }
+    // Use transcription directly - GPT refinement is causing content loss
+    // The Whisper-1 transcription is already very accurate
+    console.log(`✅ Usando transcrição direta (sem refinamento para evitar perda de conteúdo)`);
+    allTranscriptions.push(transcription.text);
     
     // Store segments with adjusted timestamps
     if (transcription.segments) {
@@ -562,12 +551,27 @@ async function dubVideo(inputVideo, sourceLang, targetLang, voiceId, askConfirma
 
     // Step 3: Translate text
     console.log(`🌐 Traduzindo para ${targetLang.name}...`);
+    
+    const wordCount = transcriptionText.split(/\s+/).length;
+    
     const translationResponse = await openai.chat.completions.create({
       model: 'o4-mini',
       messages: [
         {
           role: 'system',
-          content: `You are a professional translator. Translate the following text from ${sourceLang.systemPrompt} to ${targetLang.systemPrompt}. Keep the same tone, style, and natural flow. Only return the translated text, nothing else.`
+          content: `You are a professional translator for video dubbing. Translate the following text from ${sourceLang.systemPrompt} to ${targetLang.systemPrompt}.
+
+CRITICAL RULES FOR VIDEO DUBBING:
+- Translate EVERY single sentence and piece of information
+- Do NOT summarize, shorten, or skip ANY content
+- Maintain the same level of detail and description
+- Keep the same tone, style, and natural flow
+- The output should have approximately the SAME NUMBER OF WORDS (±15%)
+- This is for lip-sync dubbing, so completeness is critical
+
+Input has ${wordCount} words. Your translation should have around ${wordCount} words (${Math.floor(wordCount * 0.85)}-${Math.ceil(wordCount * 1.15)} words acceptable).
+
+Return ONLY the translated text, no explanations or notes.`
         },
         {
           role: 'user',
@@ -610,13 +614,27 @@ async function dubVideo(inputVideo, sourceLang, targetLang, voiceId, askConfirma
     // Step 4: Generate speech using TTS (with chunking for long texts)
     console.log(`🔊 Gerando áudio dublado com voz ${voiceId}...`);
     
-    // Calculate target duration (exclude trailing silence if we have segments)
-    let targetDuration = originalAudioDuration;
+    // Calculate speech boundaries (where actual speech starts and ends)
+    let speechStart = 0;
+    let speechEnd = originalAudioDuration;
+    let silenceAtStart = 0;
+    let silenceAtEnd = 0;
+    
     if (segments && segments.length > 0) {
-      const lastSegmentEnd = segments[segments.length - 1].end;
-      targetDuration = lastSegmentEnd; // Only match duration up to last speech
-      console.log(`🎯 Ajustando para duração da fala: ${targetDuration.toFixed(2)}s (excluindo silêncio final)\n`);
+      speechStart = segments[0].start;
+      speechEnd = segments[segments.length - 1].end;
+      silenceAtStart = speechStart;
+      silenceAtEnd = originalAudioDuration - speechEnd;
+      
+      console.log(`\n📊 Análise de silêncio:`);
+      console.log(`   Silêncio no início: ${silenceAtStart.toFixed(2)}s`);
+      console.log(`   Fala: ${speechStart.toFixed(2)}s → ${speechEnd.toFixed(2)}s (duração: ${(speechEnd - speechStart).toFixed(2)}s)`);
+      console.log(`   Silêncio no final: ${silenceAtEnd.toFixed(2)}s`);
+      console.log(`   Duração total do vídeo: ${originalAudioDuration.toFixed(2)}s\n`);
     }
+    
+    // Target duration is only for the speech part (excluding leading/trailing silence)
+    const targetDuration = speechEnd - speechStart;
     
     let finalAudioPath;
     if (translatedText.length > MAX_TTS_CHARS) {
@@ -647,27 +665,60 @@ async function dubVideo(inputVideo, sourceLang, targetLang, voiceId, askConfirma
       finalAudioPath = dubbedAudioFile;
     }
     
-    // Check final audio duration and pad with silence to match video
+    // Add silence at start and end to match original video exactly
+    console.log(`\n🔇 Adicionando silêncios do vídeo original...`);
+    
     const { stdout: currentDurationInfo } = await execAsync(`ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${finalAudioPath}"`);
     const currentAudioDuration = parseFloat(currentDurationInfo.trim());
     
-    console.log(`\n📏 Duração atual do áudio: ${currentAudioDuration.toFixed(2)}s`);
-    console.log(`📏 Duração do vídeo: ${originalAudioDuration.toFixed(2)}s`);
+    console.log(`   Áudio TTS gerado: ${currentAudioDuration.toFixed(2)}s`);
+    console.log(`   Adicionando ${silenceAtStart.toFixed(2)}s no início`);
+    console.log(`   Adicionando ${silenceAtEnd.toFixed(2)}s no final`);
     
-    const silenceNeeded = originalAudioDuration - currentAudioDuration;
+    const finalWithSilence = `dubbed_audio_with_silence_${timestamp}.mp3`;
     
-    if (silenceNeeded > 0.5) {
-      console.log(`🔇 Adicionando ${silenceNeeded.toFixed(2)}s de silêncio para igualar duração do vídeo...`);
-      const finalWithSilence = `dubbed_audio_with_silence_${timestamp}.mp3`;
-      await execAsync(`ffmpeg -i "${finalAudioPath}" -f lavfi -t ${silenceNeeded} -i anullsrc=r=44100:cl=stereo -filter_complex "[0:a][1:a]concat=n=2:v=0:a=1" "${finalWithSilence}" -y`);
+    if (silenceAtStart > 0.1 || silenceAtEnd > 0.1) {
+      // Generate silence files
+      const startSilenceFile = `silence_start_${timestamp}.mp3`;
+      const endSilenceFile = `silence_end_${timestamp}.mp3`;
+      
+      // Create concat list with start silence, audio, and end silence
+      const concatParts = [];
+      
+      if (silenceAtStart > 0.1) {
+        await execAsync(`ffmpeg -f lavfi -t ${silenceAtStart} -i anullsrc=r=44100:cl=stereo "${startSilenceFile}" -y`);
+        concatParts.push(`file '${startSilenceFile}'`);
+      }
+      
+      concatParts.push(`file '${finalAudioPath}'`);
+      
+      if (silenceAtEnd > 0.1) {
+        await execAsync(`ffmpeg -f lavfi -t ${silenceAtEnd} -i anullsrc=r=44100:cl=stereo "${endSilenceFile}" -y`);
+        concatParts.push(`file '${endSilenceFile}'`);
+      }
+      
+      // Concatenate all parts
+      const concatListFile = `concat_silence_${timestamp}.txt`;
+      fs.writeFileSync(concatListFile, concatParts.join('\n'));
+      
+      await execAsync(`ffmpeg -f concat -safe 0 -i "${concatListFile}" -c copy "${finalWithSilence}" -y`);
+      
+      // Cleanup
+      if (fs.existsSync(startSilenceFile)) fs.unlinkSync(startSilenceFile);
+      if (fs.existsSync(endSilenceFile)) fs.unlinkSync(endSilenceFile);
+      if (fs.existsSync(concatListFile)) fs.unlinkSync(concatListFile);
       
       if (finalAudioPath !== dubbedAudioFile) {
         fs.unlinkSync(finalAudioPath);
       }
       finalAudioPath = finalWithSilence;
-      console.log('✅ Silêncio adicionado\n');
+      
+      console.log('✅ Silêncios adicionados\n');
     } else {
-      console.log(`✅ Duração já está correta\n`);
+      console.log('✅ Sem silêncios significativos para adicionar\n');
+      // Rename to match expected filename
+      fs.renameSync(finalAudioPath, finalWithSilence);
+      finalAudioPath = finalWithSilence;
     }
     
     console.log('✅ Áudio dublado gerado\n');
