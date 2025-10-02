@@ -468,8 +468,20 @@ async function downloadYouTubeVideo(url, formatOption) {
     const output = data.toString();
     process.stdout.write(output);
     
-    // Capture the output filename
-    const match = output.match(/\[Merger\] Merging formats into "(.+?)"/);
+    // Capture the output filename from multiple patterns
+    let match = output.match(/\[Merger\] Merging formats into "(.+?)"/);
+    if (match) {
+      outputFile = match[1];
+    }
+    
+    // Also check for "already downloaded" message
+    match = output.match(/\[download\] (.+?) has already been downloaded/);
+    if (match) {
+      outputFile = match[1];
+    }
+    
+    // Also check for destination pattern
+    match = output.match(/\[download\] Destination: (.+?)$/m);
     if (match) {
       outputFile = match[1];
     }
@@ -488,13 +500,21 @@ async function downloadYouTubeVideo(url, formatOption) {
       if (code === 0) {
         console.log('\n✅ Download concluído!\n');
         
-        // If we couldn't capture the filename, ask user
+        // If we couldn't capture the filename, find the most recent .mp4 file
         if (!outputFile) {
-          fs.readdirSync('downloads').forEach(file => {
-            if (file.endsWith('.mp4')) {
-              outputFile = `downloads/${file}`;
-            }
-          });
+          const files = fs.readdirSync('downloads')
+            .filter(file => file.endsWith('.mp4'))
+            .map(file => ({
+              name: file,
+              path: `downloads/${file}`,
+              time: fs.statSync(`downloads/${file}`).mtime.getTime()
+            }))
+            .sort((a, b) => b.time - a.time); // Sort by most recent first
+          
+          if (files.length > 0) {
+            outputFile = files[0].path;
+            console.log(`📁 Arquivo mais recente detectado: ${files[0].name}`);
+          }
         }
         
         resolve(outputFile);
@@ -507,6 +527,8 @@ async function downloadYouTubeVideo(url, formatOption) {
 
 async function dubVideo(inputVideo, sourceLang, targetLang, voiceId, askConfirmation = true, useHybridMethod = false) {
   console.log('\n🎬 Iniciando processo de dublagem...\n');
+  console.log(`📹 Vídeo de entrada: ${inputVideo}`);
+  console.log(`🗣️  ${sourceLang.name} → ${targetLang.name}\n`);
 
   const timestamp = Date.now();
   const audioFile = `temp_audio_${timestamp}.mp3`;
