@@ -186,8 +186,105 @@ async function generateTTSForChunks(text, voiceId, timestamp, targetDuration = n
   return finalAudioFile;
 }
 
+// Hybrid method: Whisper-1 for timestamps + GPT for refinement
+async function transcribeWithHybridMethod(audioFile, language, duration, timestamp) {
+  console.log('🔬 Método híbrido: Whisper-1 (timestamps precisos)\n');
+  
+  const numChunks = Math.ceil(duration / AUDIO_CHUNK_DURATION);
+  console.log(`🔪 Dividindo em ${numChunks} chunks de ~${AUDIO_CHUNK_DURATION}s cada\n`);
+  
+  const allSegments = [];
+  const allTranscriptions = [];
+  
+  for (let i = 0; i < numChunks; i++) {
+    const startTime = i * AUDIO_CHUNK_DURATION;
+    const chunkFile = `temp_audio_chunk_${timestamp}_${i}.mp3`;
+    
+    console.log(`🎙️  Processando chunk ${i + 1}/${numChunks}...`);
+    
+    // Split audio using ffmpeg
+    await execAsync(`ffmpeg -i "${audioFile}" -ss ${startTime} -t ${AUDIO_CHUNK_DURATION} -acodec libmp3lame -q:a 2 "${chunkFile}" -y`);
+    
+    // Step 1: Transcribe with Whisper-1 to get timestamps
+    console.log(`📝 Transcrevendo com Whisper-1 (timestamps)...`);
+    const transcription = await openai.audio.transcriptions.create({
+      file: fs.createReadStream(chunkFile),
+      model: 'whisper-1',
+      language: language,
+      response_format: 'verbose_json',
+      timestamp_granularities: ['segment']
+    });
+    
+    // Step 2: Refine text with GPT - with strict instructions to preserve ALL content
+    console.log(`✨ Refinando texto com gpt-5-nano...`);
+    
+    const charCount = transcription.text.length;
+    console.log(`   Texto original: ${charCount} caracteres`);
+    
+    const refinementResponse = await openai.chat.completions.create({
+      model: 'gpt-5-nano-2025-08-07',
+      messages: [
+        {
+          role: 'system',
+          content: `You are a transcription editor. Your job is ONLY to fix transcription errors (wrong words, typos), correct grammar, and improve readability. 
+
+CRITICAL RULES:
+- You MUST preserve EVERY single piece of information
+- Do NOT summarize, condense, or shorten the text
+- Do NOT skip any sentences or paragraphs
+- The output must be approximately the SAME LENGTH as the input
+- Only fix errors, do not rewrite or paraphrase unnecessarily
+- Return ONLY the corrected text, no explanations
+
+If the input is ${charCount} characters, your output should be around ${charCount} characters (±10%).`
+        },
+        {
+          role: 'user',
+          content: transcription.text
+        }
+      ]
+    });
+    
+    const refinedText = refinementResponse.choices[0].message.content;
+    console.log(`   Texto refinado: ${refinedText.length} caracteres (${((refinedText.length/charCount)*100).toFixed(1)}%)`);
+    
+    // Warn if text was significantly shortened
+    if (refinedText.length < charCount * 0.85) {
+      console.log(`   ⚠️  AVISO: Texto foi reduzido em mais de 15%! Usando original.`);
+      allTranscriptions.push(transcription.text);
+    } else {
+      allTranscriptions.push(refinedText);
+    }
+    
+    // Store segments with adjusted timestamps
+    if (transcription.segments) {
+      transcription.segments.forEach(seg => {
+        allSegments.push({
+          start: seg.start + startTime,
+          end: seg.end + startTime,
+          text: seg.text
+        });
+      });
+    }
+    
+    console.log(`✅ Chunk ${i + 1}/${numChunks} processado\n`);
+    
+    // Cleanup chunk file
+    if (fs.existsSync(chunkFile)) fs.unlinkSync(chunkFile);
+  }
+  
+  console.log('✅ Transcrição híbrida completa\n');
+  console.log(`📊 Total de segmentos: ${allSegments.length}\n`);
+  
+  return {
+    text: allTranscriptions.join(' '),
+    duration: duration,
+    segments: allSegments
+  };
+}
+
 // Helper function to split audio file into chunks and transcribe
-async function transcribeAudioFile(audioFile, language, timestamp) {
+async function transcribeAudioFile(audioFile, language, timestamp, useHybridMethod = false) {
   const fileSize = fs.statSync(audioFile).size;
   
   // Get audio duration first
@@ -199,16 +296,53 @@ async function transcribeAudioFile(audioFile, language, timestamp) {
   
   // Force chunking for audio longer than 5 minutes (300s) to avoid incomplete transcriptions
   if (fileSize < MAX_WHISPER_FILE_SIZE && duration < 300) {
-    console.log('📝 Arquivo de áudio dentro do limite, transcrevendo diretamente...\n');
+    console.log('📝 Arquivo de áudio dentro do limite, transcrevendo...\n');
     const transcription = await openai.audio.transcriptions.create({
       file: fs.createReadStream(audioFile),
       model: 'gpt-4o-mini-transcribe',
       language: language
     });
-    return { text: transcription.text, duration: duration };
+    
+    const fullText = transcription.text;
+    
+    // Detect silence at the end using ffmpeg
+    console.log('🔍 Detectando silêncios no áudio...');
+    const { stdout: silenceOutput } = await execAsync(`ffmpeg -i "${audioFile}" -af silencedetect=noise=-30dB:d=0.5 -f null - 2>&1 | grep silence_end`);
+    
+    let lastSpeechEnd = duration;
+    if (silenceOutput) {
+      const silenceMatches = silenceOutput.match(/silence_end: ([\d.]+)/g);
+      if (silenceMatches && silenceMatches.length > 0) {
+        const lastMatch = silenceMatches[silenceMatches.length - 1];
+        const lastSilenceEnd = parseFloat(lastMatch.match(/([\d.]+)/)[0]);
+        // If last silence ends close to the end, assume speech ends there
+        if (duration - lastSilenceEnd < 2) {
+          lastSpeechEnd = lastSilenceEnd;
+        }
+      }
+    }
+    
+    // Create a pseudo-segment for the end
+    const pseudoSegments = [{
+      start: 0,
+      end: lastSpeechEnd,
+      text: fullText
+    }];
+    
+    console.log(`✅ Transcrição completa\n`);
+    
+    return { 
+      text: fullText, 
+      duration: duration,
+      segments: pseudoSegments
+    };
   }
   
   console.log('⚠️  Vídeo longo detectado - usando chunking para garantir transcrição completa\n');
+  
+  if (useHybridMethod) {
+    return await transcribeWithHybridMethod(audioFile, language, duration, timestamp);
+  }
   
   // File is too large, need to split
   console.log(`⚠️  Arquivo de áudio grande detectado (${(fileSize / 1024 / 1024).toFixed(2)} MB)`);
@@ -218,6 +352,7 @@ async function transcribeAudioFile(audioFile, language, timestamp) {
   console.log(`🔪 Dividindo em ${numChunks} chunks de ~${AUDIO_CHUNK_DURATION}s cada\n`);
   
   const transcriptions = [];
+  const allSegments = [];
   
   for (let i = 0; i < numChunks; i++) {
     const startTime = i * AUDIO_CHUNK_DURATION;
@@ -244,7 +379,36 @@ async function transcribeAudioFile(audioFile, language, timestamp) {
   }
   
   console.log('\n✅ Todas as transcrições completas, juntando texto...\n');
-  return { text: transcriptions.join(' '), duration: duration };
+  
+  // Detect silence at the end using ffmpeg on the original file
+  console.log('🔍 Detectando silêncios no áudio original...');
+  const { stdout: silenceOutput } = await execAsync(`ffmpeg -i "${audioFile}" -af silencedetect=noise=-30dB:d=0.5 -f null - 2>&1 | grep silence_end || echo ""`);
+  
+  let lastSpeechEnd = duration;
+  if (silenceOutput && silenceOutput.trim()) {
+    const silenceMatches = silenceOutput.match(/silence_end: ([\d.]+)/g);
+    if (silenceMatches && silenceMatches.length > 0) {
+      const lastMatch = silenceMatches[silenceMatches.length - 1];
+      const lastSilenceEnd = parseFloat(lastMatch.match(/([\d.]+)/)[0]);
+      // If last silence ends close to the end, assume speech ends there
+      if (duration - lastSilenceEnd < 2) {
+        lastSpeechEnd = lastSilenceEnd;
+      }
+    }
+  }
+  
+  // Create a pseudo-segment for the end
+  const pseudoSegments = [{
+    start: 0,
+    end: lastSpeechEnd,
+    text: transcriptions.join(' ')
+  }];
+  
+  return { 
+    text: transcriptions.join(' '), 
+    duration: duration, 
+    segments: pseudoSegments
+  };
 }
 
 // Language configurations
@@ -341,7 +505,7 @@ async function downloadYouTubeVideo(url, formatOption) {
   });
 }
 
-async function dubVideo(inputVideo, sourceLang, targetLang, voiceId, askConfirmation = true) {
+async function dubVideo(inputVideo, sourceLang, targetLang, voiceId, askConfirmation = true, useHybridMethod = false) {
   console.log('\n🎬 Iniciando processo de dublagem...\n');
 
   const timestamp = Date.now();
@@ -357,11 +521,22 @@ async function dubVideo(inputVideo, sourceLang, targetLang, voiceId, askConfirma
 
     // Step 2: Transcribe audio to text (with chunking for large files)
     console.log(`🎙️  Transcrevendo áudio em ${sourceLang.name}...`);
-    const transcriptionResult = await transcribeAudioFile(audioFile, sourceLang.code, timestamp);
+    const transcriptionResult = await transcribeAudioFile(audioFile, sourceLang.code, timestamp, useHybridMethod);
     const transcriptionText = transcriptionResult.text;
     const originalAudioDuration = transcriptionResult.duration;
+    const segments = transcriptionResult.segments;
+    
     console.log('✅ Transcrição completa:', transcriptionText.substring(0, 150) + '...\n');
-    console.log(`⏱️  Duração do áudio original: ${originalAudioDuration.toFixed(2)}s\n`);
+    console.log(`⏱️  Duração do áudio original: ${originalAudioDuration.toFixed(2)}s`);
+    
+    if (segments && segments.length > 0) {
+      const lastSegmentEnd = segments[segments.length - 1].end;
+      const silenceAtEnd = originalAudioDuration - lastSegmentEnd;
+      console.log(`🔊 Última fala termina em: ${lastSegmentEnd.toFixed(2)}s`);
+      console.log(`🔇 Silêncio no final: ${silenceAtEnd.toFixed(2)}s\n`);
+    } else {
+      console.log('');
+    }
 
     // Step 3: Translate text
     console.log(`🌐 Traduzindo para ${targetLang.name}...`);
@@ -413,10 +588,18 @@ async function dubVideo(inputVideo, sourceLang, targetLang, voiceId, askConfirma
     // Step 4: Generate speech using TTS (with chunking for long texts)
     console.log(`🔊 Gerando áudio dublado com voz ${voiceId}...`);
     
+    // Calculate target duration (exclude trailing silence if we have segments)
+    let targetDuration = originalAudioDuration;
+    if (segments && segments.length > 0) {
+      const lastSegmentEnd = segments[segments.length - 1].end;
+      targetDuration = lastSegmentEnd; // Only match duration up to last speech
+      console.log(`🎯 Ajustando para duração da fala: ${targetDuration.toFixed(2)}s (excluindo silêncio final)\n`);
+    }
+    
     let finalAudioPath;
     if (translatedText.length > MAX_TTS_CHARS) {
       console.log(`⚠️  Texto longo detectado (${translatedText.length} caracteres)\n`);
-      finalAudioPath = await generateTTSForChunks(translatedText, voiceId, timestamp, originalAudioDuration);
+      finalAudioPath = await generateTTSForChunks(translatedText, voiceId, timestamp, targetDuration);
       
       if (!finalAudioPath) {
         // Fallback to single TTS if chunking returned null
@@ -440,6 +623,29 @@ async function dubVideo(inputVideo, sourceLang, targetLang, voiceId, askConfirma
       const buffer = Buffer.from(await speechResponse.arrayBuffer());
       fs.writeFileSync(dubbedAudioFile, buffer);
       finalAudioPath = dubbedAudioFile;
+    }
+    
+    // Check final audio duration and pad with silence to match video
+    const { stdout: currentDurationInfo } = await execAsync(`ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${finalAudioPath}"`);
+    const currentAudioDuration = parseFloat(currentDurationInfo.trim());
+    
+    console.log(`\n📏 Duração atual do áudio: ${currentAudioDuration.toFixed(2)}s`);
+    console.log(`📏 Duração do vídeo: ${originalAudioDuration.toFixed(2)}s`);
+    
+    const silenceNeeded = originalAudioDuration - currentAudioDuration;
+    
+    if (silenceNeeded > 0.5) {
+      console.log(`🔇 Adicionando ${silenceNeeded.toFixed(2)}s de silêncio para igualar duração do vídeo...`);
+      const finalWithSilence = `dubbed_audio_with_silence_${timestamp}.mp3`;
+      await execAsync(`ffmpeg -i "${finalAudioPath}" -f lavfi -t ${silenceNeeded} -i anullsrc=r=44100:cl=stereo -filter_complex "[0:a][1:a]concat=n=2:v=0:a=1" "${finalWithSilence}" -y`);
+      
+      if (finalAudioPath !== dubbedAudioFile) {
+        fs.unlinkSync(finalAudioPath);
+      }
+      finalAudioPath = finalWithSilence;
+      console.log('✅ Silêncio adicionado\n');
+    } else {
+      console.log(`✅ Duração já está correta\n`);
     }
     
     console.log('✅ Áudio dublado gerado\n');
@@ -659,14 +865,28 @@ async function main() {
     return;
   }
 
-  const confirmChoice = await question('\n💡 Deseja revisar a tradução antes de gerar o áudio? (s/n): ');
+  // Select transcription method
+  console.log('\n🔬 Método de transcrição:\n');
+  console.log('  1. Rápido e Econômico (gpt-4o-mini + detecção de silêncio)');
+  console.log('  2. Preciso com Timestamps (whisper-1 com timestamps exatos)\n');
+  
+  const transcriptionChoice = await question('🔢 Escolha o método (Enter=Rápido): ');
+  const useHybridMethod = transcriptionChoice === '2';
+  
+  if (useHybridMethod) {
+    console.log('✨ Usando método com timestamps: Whisper-1\n');
+  } else {
+    console.log('⚡ Usando método rápido: gpt-4o-mini + ffmpeg\n');
+  }
+
+  const confirmChoice = await question('💡 Deseja revisar a tradução antes de gerar o áudio? (s/n): ');
   const askConfirmation = confirmChoice.toLowerCase() === 's';
 
   rl.close();
 
   // Start dubbing
   try {
-    await dubVideo(videoFile, sourceLang, targetLang, voiceId, askConfirmation);
+    await dubVideo(videoFile, sourceLang, targetLang, voiceId, askConfirmation, useHybridMethod);
     console.log('\n🌟 Processo concluído com sucesso! 🌟\n');
   } catch (error) {
     console.error('\n❌ Erro:', error.message);

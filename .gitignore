@@ -48,3 +48,6 @@ logs/
 # Build outputs
 dist/
 build/
+
+# Debug Logs
+debug_logs/
